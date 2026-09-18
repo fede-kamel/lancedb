@@ -4489,4 +4489,76 @@ mod tests {
         .unwrap();
         assert!(grouped.input_column("x").is_err());
     }
+
+    /// Twenty vectors in two clusters far apart, ids 0-9 and 10-19.
+    async fn clustered_source(conn: &Connection) -> Table {
+        use arrow_array::types::Float32Type;
+        use arrow_array::{FixedSizeListArray, Int32Array};
+
+        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            (0..20).map(|i| {
+                let base = if i < 10 { 0.0 } else { 100.0 };
+                Some(vec![Some(base + i as f32 * 0.1), Some(base)])
+            }),
+            2,
+        );
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..20)) as arrow_array::ArrayRef,
+            ),
+            ("vec", Arc::new(vectors) as arrow_array::ArrayRef),
+        ])
+        .unwrap();
+        conn.create_table("images", batch)
+            .write_options(crate::materialized_view::tests::stable_row_ids())
+            .execute()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ivf_partition_groups_by_the_index_on_the_column() {
+        use crate::index::vector::IvfFlatIndexBuilder;
+
+        const BUCKETS: &str = "SELECT ivf_partition(vec) AS bucket, count(*) AS n, \
+             min(id) AS lo, max(id) AS hi FROM images GROUP BY ivf_partition(vec)";
+        let conn = connect("memory://").execute().await.unwrap();
+        let source = clustered_source(&conn).await;
+        let unindexed = declare(&source, "buckets", BUCKETS).await.unwrap_err();
+        assert!(
+            unindexed.to_string().contains("IVF vector index"),
+            "{unindexed}"
+        );
+
+        source
+            .create_index(
+                &["vec"],
+                Index::IvfFlat(IvfFlatIndexBuilder::default().num_partitions(2)),
+            )
+            .execute()
+            .await
+            .unwrap();
+        let view = declare(&source, "buckets", BUCKETS).await.unwrap();
+        view.refresh().execute().await.unwrap();
+        assert_eq!(
+            rows(view.table(), &["n", "lo", "hi"]).await,
+            ["10 0 9", "10 10 19"]
+        );
+        let buckets = rows(view.table(), &["bucket"]).await;
+        assert_eq!(buckets, ["0", "1"]);
+    }
+
+    #[tokio::test]
+    async fn ivf_partition_takes_a_column() {
+        let conn = connect("memory://").execute().await.unwrap();
+        let source = clustered_source(&conn).await;
+        for sql in [
+            "SELECT ivf_partition(id) AS b, count(*) AS n FROM images GROUP BY ivf_partition(id)",
+            "SELECT ivf_partition(vec, vec) AS b, count(*) AS n FROM images \
+             GROUP BY ivf_partition(vec, vec)",
+        ] {
+            assert!(declare(&source, "v", sql).await.is_err(), "{sql}");
+        }
+    }
 }
